@@ -24,6 +24,51 @@ import { isRecord } from "@/util/record"
 const DOOM_LOOP_THRESHOLD = 3
 const log = Log.create({ service: "session.processor" })
 
+interface ToolCallMatch {
+  toolName: string
+  arguments: Record<string, unknown>
+}
+
+function parseToolCallsFromText(text: string): ToolCallMatch[] {
+  const matches: ToolCallMatch[] = []
+  const toolCallPattern = /{"(?:tool_)?name"\s*:\s*"(\w+Tool|\w+)","arguments"\s*:\s*(\{[^}]+\}|"[^"]*")}/
+  const bracketToolCallPattern = /(?:tool_call|toolCall)\s*[=:]\s*\{"name"\s*:\s*"(\w+)"(?:[^}]*)\}/i
+  const jsonArrayPattern = /\[[\s\S]*"name"\s*:\s*"(\w+)"[\s\S]*"input"\s*:\s*(\{[^}]+\})[\s\S]*\]/
+  try {
+    const jsonMatches = text.matchAll(/\{[\s\S]*?"name"\s*:\s*"([^"]+)"[\s\S]*?"arguments"\s*:\s*(\{[^}]+\}|"[^"]*")[\s\S]*?\}/g)
+    for (const match of jsonMatches) {
+      const toolName = match[1]
+      const argsStr = match[2]
+      if (!toolName || !argsStr) continue
+      try {
+        const args = argsStr.startsWith("{") ? JSON.parse(argsStr) : JSON.parse(`"${argsStr}"`)
+        matches.push({ toolName, arguments: args as Record<string, unknown> })
+      } catch {
+        log.debug("parseToolCallsFromText", { skipArgsParse: argsStr })
+      }
+    }
+  } catch (e) {
+    log.debug("parseToolCallsFromText", { error: String(e) })
+  }
+  if (matches.length === 0) {
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item.name && item.arguments) {
+            matches.push({ toolName: item.name, arguments: item.arguments })
+          }
+        }
+      } else if (parsed.name && parsed.arguments) {
+        matches.push({ toolName: parsed.name, arguments: parsed.arguments })
+      }
+    } catch {
+      log.debug("parseToolCallsFromText", { notJson: true })
+    }
+  }
+  return matches
+}
+
 export type Result = "compact" | "stop" | "continue"
 
 export type Event = LLM.Event
@@ -447,6 +492,33 @@ export const layer: Layer.Layer<
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
             }
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+            const finalText = ctx.currentText.text
+            // FALLBACK: If no tool calls were detected via SDK events, try parsing from text
+            // This fixes Ollama/local model subagent tool execution bug (#21181)
+            if (Object.keys(ctx.toolcalls).length === 0 && finalText) {
+              const fallbackToolCalls = parseToolCallsFromText(finalText)
+              if (fallbackToolCalls.length > 0) {
+                log.info("fallback_tool_parse", { count: fallbackToolCalls.length, text: finalText.substring(0, 200) })
+                for (const tc of fallbackToolCalls) {
+                  const toolCallId = `fallback-${tc.toolName}-${Date.now()}`
+                  const part = yield* session.updatePart({
+                    id: PartID.ascending(),
+                    messageID: ctx.assistantMessage.id,
+                    sessionID: ctx.assistantMessage.sessionID,
+                    type: "tool",
+                    tool: tc.toolName,
+                    callID: toolCallId,
+                    state: { status: "running", input: tc.arguments, time: { start: Date.now() } },
+                  } satisfies MessageV2.ToolPart)
+                  ctx.toolcalls[toolCallId] = {
+                    done: yield* Deferred.make<void>(),
+                    partID: part.id,
+                    messageID: part.messageID,
+                    sessionID: part.sessionID,
+                  }
+                }
+              }
+            }
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined
             return
